@@ -1,0 +1,365 @@
+<?php
+
+/**
+ * @file
+ * Implements Unionpay in Drupal Commerce checkout.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_unionpay_menu() {
+  $items['commerce_unionpay/notify'] = array(
+    'page callback' => 'commerce_unionpay_process_notify',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items['commerce_unionpay/notify/%commerce_payment_method_instance'] = array(
+    'page callback' => 'commerce_unionpay_process_notify',
+    'page arguments' => array(2),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+/**
+ * Unionpay notify process.
+ */
+function commerce_unionpay_process_notify($payment_method_instance = NULL) {
+  if (empty($_POST)) {
+    return FALSE;
+  }
+  //The order id in unionpay is Ymd-[order_id].
+  //We need to proceed it to get the order id in commerce.
+  (int)$order_id = substr($_POST['orderNumber'],15);
+  if ($order = commerce_order_load($order_id)) {
+    if (empty($payment_method_instance)) {
+      watchdog('test', 'empty payment instance argument');
+      $payment_method_instance = commerce_payment_method_instance_load($order->data['payment_method']);
+    } 
+    if (!empty($payment_method_instance) && commerce_unionpay_notify_validate($order, $payment_method_instance, $_POST)) {
+      watchdog('test', 'payment instance is :' . print_r($payment_method_instance));
+      commerce_unionpay_notify_submit($order, $payment_method_instance, $_POST);
+    }
+  } else {
+    return FALSE;
+  }
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_unionpay_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['unionpay'] = array(
+    'base' => 'commerce_unionpay',
+    'title' => t('Unionpay'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => false,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_unionpay_settings_form($settings = NULL) {
+  $form = array();
+
+  $form['merabbr'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant Name'),
+    '#description' => t('The Merchant Name'),
+    '#default_value' => empty($settings['merabbr']) ? '' : $settings['merabbr'],
+    '#required' => TRUE,
+  );
+  $form['merid'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant ID'),
+    '#description' => t('The Merchant ID'),
+    '#default_value' => empty($settings['merid']) ? '' : $settings['merid'],
+    '#required' => TRUE,
+  );
+  $form['security_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Security Key'),
+    '#description' => t('The Security Key of Merchant.'),
+    '#default_value' => empty($settings['security_key']) ? '' : $settings['security_key'],
+    '#required' => TRUE,
+  );
+  $form['mode'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('test mode.'),
+    '#description' => t('Check it it use the test mode.'),
+    '#default_value' => empty($settings['mode']) ? FALSE : $settings['mode'],
+  );
+  $form['test'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Arbitrary test amount'),
+    '#description' => t('If this is enabled. it will ignore the order amount, using the amount below. Be careful to enable this when your site is online.'),
+    '#default_value' => empty($settings['test']) ? FALSE : $settings['test'],
+  );
+  $form['test_amount'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Test Amount'),
+    '#description' => t('Input test amount here. Example: 1, 0.08'),
+    '#default_value' => empty($settings['test_amount']) ? '' : $settings['test_amount'],
+    '#required' => FALSE,
+    '#states' => array(
+      'invisible' => array(
+        ':input[name="parameter[payment_method][settings][payment_method][settings][test]"]' => array('checked' => FALSE),
+      ),
+    ),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: adds a message to the submission form.
+ */
+function commerce_unionpay_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form['unionpay_information'] = array(
+    '#markup' => '<span class="commerce-unionpay-info">' . t('(Continue with checkout to complete payment via Unionpay.)') . '</span>',
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: Before redirect, vilidate basic config.
+ */
+function commerce_unionpay_submit_form_validate($payment_method, $pane_values, $checkout_pane, $order) {
+ // Return an error if the enabling action's settings haven't been configured.
+  foreach (array('merid', 'merabbr', 'security_key') as $key) {
+   if (empty($payment_method['settings'][$key])) {
+      drupal_set_message(t('Unionpay Checkout is not configured for use. Please contact an administrator to resolve this issue.'), 'error');
+     return FALSE;
+    }
+  }
+ 
+  return TRUE;
+}
+
+/**
+ * Payment method callback: redirect form.
+ */
+function commerce_unionpay_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['merid']) || empty($payment_method['settings']['security_key']) ) {
+    drupal_set_message(t('Unionpay is not configured for use. No Merchant ID or Security Key has been specified.'), 'error');
+    return array();
+  }
+  //Generate the parameter...
+  $param = _commerce_unionpay_parameter_callback($order, $payment_method);
+
+  foreach ($param as $name => $value) {
+    $value = trim($value);
+    // Add the value as a hidden form element.
+    $form[$name] = array('#type' => 'hidden', '#value' => $value);
+  }
+  //Choose which api_url should be used based on the config.
+  $form['#api_url'] = $payment_method['settings']['mode'] ? quickpay_conf::$test_front_pay_url : quickpay_conf::$front_pay_url;
+  $form['#unionpay'] = $param;
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed with Unionpay'),
+    '#submit' => array('commerce_unionpay_redirect'),
+  );
+  $form['#attributes'] = array('target' => '_blank');
+
+  return $form;
+}
+/**
+ * callback for generate the parameter for unionpay.
+ * param
+ *   $order: commerce order object.
+ *   $payment_method_instance: commerce payment instance object.
+ * return
+ *   the parameter for unionpay that for post.
+ */
+function _commerce_unionpay_parameter_callback($order, $payment_method) {
+  require_once(dirname(__FILE__) . '/unionpay_quickpay_conf.php');
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+  if ($payment_method['settings']['test'] && is_numeric($payment_method['settings']['test_amount'])) {
+    (int)$amount = $payment_method['settings']['test_amount'] * 100;
+  } else {
+    $amount = $order_wrapper->commerce_order_total->amount->value();
+  }
+
+  $param = array_merge(quickpay_conf::$pay_params, quickpay_conf::$pay_params_empty);
+
+  $param['merId'] = $payment_method['settings']['merid'];
+  $param['merAbbr'] = $payment_method['settings']['merabbr'];
+  //交易类型，CONSUME or PRE_AUTH
+  $param['transType'] = quickpay_conf::CONSUME;
+
+  $param['orderAmount'] = $amount;
+  $param['orderNumber'] = date('YmdHis', $order->changed) . '-' . $order->order_id;
+  $param['orderTime'] = date('YmdHis', $order->changed);
+  $param['orderCurrency'] = quickpay_conf::CURRENCY_CNY;
+
+  $param['customerIp'] = $order->hostname;
+  $param['frontEndUrl'] = url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE));
+  $param['backEndUrl'] = url('commerce_unionpay/notify/' . $payment_method['instance_id'], array('absolute' => TRUE));
+
+
+  //get sign string.
+  $sign  = unionpay_sign($param, $payment_method['settings']['security_key'], 'md5'); 
+  $param['signature'] = $sign;
+  $param['signMethod'] = 'md5';
+
+  return $param;
+}
+
+/**
+ * Redirect to Unionpay.
+ */
+function commerce_unionpay_redirect($form, &$form_state) {
+  form_state_values_clean($form_state);
+  $data = drupal_http_build_query($form_state['values']);
+  
+  $form_state['redirect'] = $form['#api_url'] . '?' . $data;
+}
+
+/**
+ * Payment method callback: redirect form return validation.
+ * 这里看起来执行的是前台调用url的form
+ */
+function commerce_unionpay_redirect_form_validate($order, $payment_method) {
+  return commerce_unionpay_notify_validate($order, $payment_method, $_POST);
+}
+
+/**
+ * Payment method callback: redirect form return submit.
+ */
+function commerce_unionpay_redirect_form_submit($order, $payment_method) {
+  return commerce_unionpay_notify_submit($order, $payment_method, $_POST);
+}
+
+/**
+ * Alipay notify validate.
+ */
+function commerce_unionpay_notify_validate($order, $payment_method_instance, $notify) {
+  require_once(dirname(__FILE__) . '/unionpay_quickpay_conf.php');
+  //See D-6 中国银联在线支付业务商户接入技术改造指南.doc
+  //P16-17
+  $ret_sign = $notify['signature'];
+  unset($notify['signature']);
+  unset($notify['signMethod']);
+  $verify_sign = unionpay_sign($notify, $payment_method_instance['settings']['security_key']);
+  if (empty($notify)) {
+    return FALSE;
+  } 
+  //verify the signature
+  elseif ($ret_sign == $verify_sign) {
+    watchdog('test', 'notify sign:' . $notify['signature'] . '$param sign:' . $param['signature']);
+    return TRUE;
+  } 
+  //Other condition..
+  else {
+    // Attempt to provide a notify array which didn't validate or is empty
+    // @TODO: print in the drupal set message the notify array with <pre>
+    drupal_set_message(t('Unexpeced error, please contact site admin for more information.'), 'error');
+    return FALSE;
+  }
+}
+
+/**
+ * Unionpay notify submit.
+ */
+function commerce_unionpay_notify_submit($order, $payment_method, $notify) {
+  // created a transaction...
+  $transactions = commerce_payment_transaction_load_multiple(array(), array('remote_id' => $notify["qid"]));
+  if (!empty($transactions)) {
+    $transaction = reset($transactions);
+  }
+  else {
+    // Create a new payment transaction for the order.
+    $transaction = commerce_payment_transaction_new($payment_method['method_id'], $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+  }
+  $transaction->amount = commerce_currency_decimal_to_amount($notify['orderAmount'], 'CNY')/100;
+  $transaction->currency_code = 'CNY';
+
+  $transaction->remote_id = $notify["qid"];
+  // Set the transaction's statuses based on the notify's respMsg.
+  $transaction->remote_status = $notify['respMsg'];
+  $transaction->data['notify'] = $notify;
+
+  switch ($notify['respCode']) {
+    case '00':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = commerce_unionpay_status_message($notify['respCode']);
+      //commerce_order_status_update($order, 'checkout_complete');
+      break;
+
+    case '01':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = commerce_unionpay_status_message($notify['respCode']);
+      break;
+
+    case '02':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = commerce_unionpay_status_message($notify['respCode']);
+      //commerce_order_status_update($order, 'checkout_complete');
+      break;
+
+    case '03':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = commerce_unionpay_status_message($notify['respCode']);
+      break;
+  }
+
+  commerce_payment_transaction_save($transaction);
+  watchdog('commerce_unionpay', 'Notify processed for Order @order_number with remote ID @qid . Browser: @browser', array('@qid' => $notify["qid"], '@order_number' => $order->order_number, '@browser' => $_SERVER['HTTP_USER_AGENT']), WATCHDOG_INFO);
+}
+
+/**
+ * ref: 
+ * https://online.unionpay.com/mer/doc/viewDoc.action
+ * Doc: D-7互联网商户接入接口规范.doc
+ * Page: 23 :: respCode
+ */
+function commerce_unionpay_status_message($status) {
+  switch ($status) {
+    case '00':
+      return t('Success.');
+    case '01':
+      return t('Failure.');
+    case '02':
+      return t('In proceeding.');
+    case '03':
+      return t('Non exist transaction.');
+    default:
+      return t('Unexpected result. Please contact admin.');
+  }
+}
+
+/**
+ * function for generate the unionpay signiture key.
+ * ref: https://online.unionpay.com/mer/doc/viewDoc.action
+ * Doc: D-7互联网商户接入接口规范.doc
+ * Page: 25
+ */
+function unionpay_sign($params = array(), $security_key, $sign_method = 'md5') {
+  if (strtolower($sign_method) == "md5") {
+    ksort($params);
+    $sign_str = "";
+    foreach ($params as $key => $val) {
+      if (in_array($key, quickpay_conf::$sign_ignore_params)) {
+        continue;
+      }
+      $sign_str .= sprintf("%s=%s&", $key, $val);
+    }
+    return md5($sign_str . md5($security_key));
+  } else {
+    throw new Exception("Unknown sign_method set in quickpay_conf");
+  }
+}  
