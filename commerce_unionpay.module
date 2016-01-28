@@ -9,6 +9,7 @@
  * Implements hook_menu().
  */
 function commerce_unionpay_menu() {
+  $items = array();
   $items['commerce_unionpay/notify'] = array(
     'page callback' => 'commerce_unionpay_process_notify',
     'access callback' => TRUE,
@@ -20,7 +21,6 @@ function commerce_unionpay_menu() {
     'access callback' => TRUE,
     'type' => MENU_CALLBACK,
   );
-
   return $items;
 }
 /**
@@ -35,11 +35,11 @@ function commerce_unionpay_process_notify($payment_method_instance = NULL) {
   (int)$order_id = substr($_POST['orderNumber'],15);
   if ($order = commerce_order_load($order_id)) {
     if (empty($payment_method_instance)) {
-      watchdog('test', 'empty payment instance argument');
+      watchdog('commerce_unionpay', 'empty payment instance argument');
       $payment_method_instance = commerce_payment_method_instance_load($order->data['payment_method']);
     } 
     if (!empty($payment_method_instance) && commerce_unionpay_notify_validate($order, $payment_method_instance, $_POST)) {
-      watchdog('test', 'payment instance is :' . print_r($payment_method_instance));
+      watchdog('commerce_unionpay', 'payment instance is :' . print_r($payment_method_instance));
       commerce_unionpay_notify_submit($order, $payment_method_instance, $_POST);
     }
   } else {
@@ -141,7 +141,6 @@ function commerce_unionpay_submit_form_validate($payment_method, $pane_values, $
      return FALSE;
     }
   }
- 
   return TRUE;
 }
 
@@ -176,10 +175,10 @@ function commerce_unionpay_redirect_form($form, &$form_state, $order, $payment_m
 }
 /**
  * callback for generate the parameter for unionpay.
- * param
+ * @param
  *   $order: commerce order object.
  *   $payment_method_instance: commerce payment instance object.
- * return
+ * @return
  *   the parameter for unionpay that for post.
  */
 function _commerce_unionpay_parameter_callback($order, $payment_method) {
@@ -209,7 +208,6 @@ function _commerce_unionpay_parameter_callback($order, $payment_method) {
   $param['frontEndUrl'] = url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE));
   $param['backEndUrl'] = url('commerce_unionpay/notify/' . $payment_method['instance_id'], array('absolute' => TRUE));
 
-
   //get sign string.
   $sign  = unionpay_sign($param, $payment_method['settings']['security_key'], 'md5'); 
   $param['signature'] = $sign;
@@ -230,7 +228,6 @@ function commerce_unionpay_redirect($form, &$form_state) {
 
 /**
  * Payment method callback: redirect form return validation.
- * 这里看起来执行的是前台调用url的form
  */
 function commerce_unionpay_redirect_form_validate($order, $payment_method) {
   return commerce_unionpay_notify_validate($order, $payment_method, $_POST);
@@ -259,7 +256,7 @@ function commerce_unionpay_notify_validate($order, $payment_method_instance, $no
   } 
   //verify the signature
   elseif ($ret_sign == $verify_sign) {
-    watchdog('test', 'notify sign:' . $notify['signature'] . '$param sign:' . $param['signature']);
+    watchdog('commerce_unionpay', 'notify sign:' . $notify['signature'] . '$param sign:' . $param['signature']);
     return TRUE;
   } 
   //Other condition..
